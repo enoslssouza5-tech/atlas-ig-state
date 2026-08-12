@@ -1,9 +1,9 @@
 {
-  "atualizado_em": null,
+  "atualizado_em": "2026-08-12T16:42:26.310513-03:00",
   "janela_dias": 90,
   "amostra_minima": 3,
-  "total_posts_considerados": 0,
+  "total_posts_considerados": 1,
   "janelas_validas": 0,
   "ranking": [],
-  "observacao": "sem dados ainda; use horario padrao 11:00 e 19:00"
+  "observacao": "sem janela com amostra suficiente ainda; mantenha horário padrão"
 }
