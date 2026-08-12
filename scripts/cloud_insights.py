@@ -16,7 +16,7 @@ Config por env (passadas pela rotina de nuvem):
   IG_TOKEN, IG_USER, IG_VER(=v21.0), GH_TOKEN, STATE_REPO
 Sem dependências externas (só stdlib).
 """
-import os, sys, json, base64, argparse, urllib.request, urllib.parse, urllib.error
+import os, sys, json, base64, time, argparse, urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -68,9 +68,18 @@ def gh_write(repo, path, token, text, message, sha=None):
     return res
 
 def gh_append_line(repo, path, token, line, message):
-    text, sha = gh_read(repo, path, token)
-    new = (text or "") + line.rstrip("\n") + "\n"
-    gh_write(repo, path, token, new, message, sha)
+    """Append com retry: em conflito de sha (409), relê e tenta de novo."""
+    for attempt in range(5):
+        text, sha = gh_read(repo, path, token)
+        new = (text or "") + line.rstrip("\n") + "\n"
+        try:
+            gh_write(repo, path, token, new, message, sha)
+            return
+        except RuntimeError as e:
+            if "409" in str(e) and attempt < 4:
+                time.sleep(1.5)
+                continue
+            raise
 
 # ---------- Instagram Graph API ----------
 def graph_host(token):
