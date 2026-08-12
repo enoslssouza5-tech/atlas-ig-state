@@ -1,25 +1,27 @@
-"""Publicador de nuvem — Atlas IG.
+"""Publicador de nuvem — Atlas IG (modelo git).
 
-Roda numa rotina de nuvem (ou local). Lê a fila de posts no repositório de
-estado (atlas-ig-state) via GitHub Contents API, publica no Instagram o item
-cuja hora agendada já chegou, e move o item de queue/ para published/.
+Opera sobre um CHECKOUT LOCAL do repositório de estado (atlas-ig-state), que a
+rotina de nuvem clona no diretório de trabalho. Lê a fila em queue/, publica no
+Instagram o item cuja hora agendada já chegou, move o item para published/ e
+persiste o estado com git commit + push.
 
 As imagens JÁ estão como URLs públicas no item da fila (subidas pelo enqueue.py),
 então aqui não há upload: só cria os containers e publica.
 
-Config por variáveis de ambiente (passadas pela rotina de nuvem):
+Config por env (passadas pela rotina de nuvem):
   IG_TOKEN     token do Instagram (IGAA...)
   IG_USER      ig_user_id
   IG_VER       versão da Graph API (default v21.0)
-  GH_TOKEN     token do GitHub (acesso ao atlas-ig-state)
-  STATE_REPO   owner/repo do cofre de estado (ex.: enoslssouza5-tech/atlas-ig-state)
-  SLOT         (opcional) faixa alvo "11:00" ou "19:00"; se ausente, publica o mais antigo vencido
 
-Uso local de teste:
-  IG_TOKEN=... IG_USER=... GH_TOKEN=... STATE_REPO=... python cloud_publish.py --dry-run
-Sem dependências externas (só stdlib).
+Args:
+  --repo-dir   raiz do checkout do atlas-ig-state (default: diretório atual)
+  --slot       (opcional) faixa alvo "11:00"/"19:00"; se ausente, publica o mais antigo vencido
+  --dry-run    não publica nem faz commit; só mostra o que faria
+  --no-push    faz commit local mas não dá push (para teste)
+
+Sem dependências externas (só stdlib + git no PATH).
 """
-import os, sys, json, time, base64, argparse, urllib.request, urllib.parse, urllib.error
+import os, sys, json, time, glob, argparse, subprocess, urllib.request, urllib.parse
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -36,48 +38,30 @@ def env(k, default=None, required=False):
         sys.exit(f"ERRO: falta a variável de ambiente {k}")
     return v
 
-# ---------- GitHub Contents API ----------
-def gh_req(method, path, token, body=None):
-    url = "https://api.github.com" + path
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
-        "User-Agent": "atlas-ig", "X-GitHub-Api-Version": "2022-11-28"})
-    try:
-        with urllib.request.urlopen(req) as r:
-            return r.status, json.loads(r.read().decode() or "{}")
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode() or "{}")
+# ---------- git ----------
+def git(repo_dir, *args, check=True):
+    r = subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} -> {r.returncode}: {r.stderr.strip()}")
+    return r.stdout.strip()
 
-def gh_list(repo, folder, token):
-    st, res = gh_req("GET", f"/repos/{repo}/contents/{folder}", token)
-    if st == 404:
-        return []
-    if st != 200:
-        raise RuntimeError(f"list {folder} -> {st}: {res}")
-    return [f for f in res if f["type"] == "file"]
-
-def gh_get_json(repo, path, token):
-    st, res = gh_req("GET", f"/repos/{repo}/contents/{urllib.parse.quote(path)}", token)
-    if st != 200:
-        raise RuntimeError(f"get {path} -> {st}: {res}")
-    content = base64.b64decode(res["content"]).decode()
-    return json.loads(content), res["sha"]
-
-def gh_put(repo, path, token, obj, message):
-    content = base64.b64encode(json.dumps(obj, ensure_ascii=False, indent=2).encode()).decode()
-    body = {"message": message, "content": content, "branch": "main"}
-    st, res = gh_req("PUT", f"/repos/{repo}/contents/{urllib.parse.quote(path)}", token, body)
-    if st not in (200, 201):
-        raise RuntimeError(f"put {path} -> {st}: {res}")
-    return res
-
-def gh_delete(repo, path, token, sha, message):
-    body = {"message": message, "sha": sha, "branch": "main"}
-    st, res = gh_req("DELETE", f"/repos/{repo}/contents/{urllib.parse.quote(path)}", token, body)
-    if st != 200:
-        raise RuntimeError(f"delete {path} -> {st}: {res}")
-    return res
+def git_commit_push(repo_dir, message, push=True):
+    # garante identidade (ambiente de nuvem pode não ter)
+    if not git(repo_dir, "config", "user.email", check=False):
+        git(repo_dir, "config", "user.email", "bot@atlas-ig", check=False)
+    if not git(repo_dir, "config", "user.name", check=False):
+        git(repo_dir, "config", "user.name", "atlas-ig-bot", check=False)
+    git(repo_dir, "add", "-A")
+    status = git(repo_dir, "status", "--porcelain")
+    if not status:
+        print("Nada para commitar.")
+        return
+    git(repo_dir, "commit", "-m", message)
+    if push:
+        git(repo_dir, "push", "origin", "HEAD")
+        print("git push ok.")
+    else:
+        print("commit local ok (sem push).")
 
 # ---------- Instagram Graph API ----------
 def graph_host(token):
@@ -126,9 +110,8 @@ def publish_carousel(token, ver, ig_user, image_urls, caption):
 
 # ---------- Seleção do item da fila ----------
 def parse_when(item):
-    """Retorna datetime (BR) agendado do item, a partir de date + slot."""
-    d = item.get("date")  # "2026-08-13"
-    slot = item.get("slot", "11:00")  # "11:00"
+    d = item.get("date")
+    slot = item.get("slot", "11:00")
     try:
         hh, mm = slot.split(":")
         y, mo, da = map(int, d.split("-"))
@@ -136,42 +119,43 @@ def parse_when(item):
     except Exception:
         return None
 
-def pick_due(repo, token, slot_filter):
-    """Escolhe o item pendente mais antigo cujo horário já venceu (catch-up)."""
+def pick_due(repo_dir, slot_filter):
     now = datetime.now(BR)
-    files = gh_list(repo, "queue", token)
     candidates = []
-    for f in files:
-        if not f["name"].endswith(".json"):
+    for path in sorted(glob.glob(os.path.join(repo_dir, "queue", "*.json"))):
+        try:
+            item = json.load(open(path, encoding="utf-8"))
+        except Exception:
             continue
-        item, sha = gh_get_json(repo, f"queue/{f['name']}", token)
         when = parse_when(item)
         if when is None:
             continue
         if slot_filter and item.get("slot") != slot_filter:
             continue
-        if when <= now + timedelta(minutes=5):  # já venceu (5 min de folga)
-            candidates.append((when, f["name"], item, sha))
+        if when <= now + timedelta(minutes=5):
+            candidates.append((when, path, item))
     candidates.sort(key=lambda x: x[0])
     return candidates[0] if candidates else None
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--repo-dir", default=".")
     ap.add_argument("--slot", default=os.environ.get("SLOT"))
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-push", action="store_true")
     a = ap.parse_args()
 
     ig_token = env("IG_TOKEN", required=True)
     ig_user = env("IG_USER", required=True)
     ig_ver = env("IG_VER", "v21.0")
-    gh_token = env("GH_TOKEN", required=True)
-    state_repo = env("STATE_REPO", required=True)
+    repo_dir = os.path.abspath(a.repo_dir)
 
-    picked = pick_due(state_repo, gh_token, a.slot)
+    picked = pick_due(repo_dir, a.slot)
     if not picked:
         print(f"Nada vencido na fila (slot={a.slot or 'qualquer'}). Nada a publicar.")
         return
-    when, name, item, sha = picked
+    when, path, item = picked
+    name = os.path.basename(path)
     imgs = item.get("images", [])
     caption = item.get("caption", "")
     print(f"Item: {name} | agendado {when.isoformat()} | {len(imgs)} imagem(ns) | slot {item.get('slot')}")
@@ -180,9 +164,8 @@ def main():
         print("[dry-run] URLs:")
         for u in imgs:
             print("  -", u)
-        print("[dry-run] legenda:", caption[:80], "...")
+        print("[dry-run] legenda:", (caption[:80] + "...") if caption else "(vazia)")
         return
-
     if not imgs:
         raise RuntimeError(f"item {name} sem imagens")
 
@@ -190,11 +173,14 @@ def main():
     media_id = res.get("id")
     print("Publicado! media id:", media_id)
 
-    # move queue -> published
+    # move queue -> published no checkout local
     done = dict(item, status="published", media_id=media_id,
                 published_at=datetime.now(BR).isoformat())
-    gh_put(state_repo, f"published/{name}", gh_token, done, f"publish {name} -> {media_id}")
-    gh_delete(state_repo, f"queue/{name}", gh_token, sha, f"remove {name} da fila (publicado)")
+    os.makedirs(os.path.join(repo_dir, "published"), exist_ok=True)
+    with open(os.path.join(repo_dir, "published", name), "w", encoding="utf-8") as f:
+        json.dump(done, f, ensure_ascii=False, indent=2)
+    os.remove(path)
+    git_commit_push(repo_dir, f"publish {name} -> {media_id}", push=not a.no_push)
     print("Fila atualizada: movido para published/.")
 
 if __name__ == "__main__":
