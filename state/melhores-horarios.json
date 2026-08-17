@@ -1,8 +1,8 @@
 {
-  "atualizado_em": "2026-08-12T19:19:45.704263-03:00",
+  "atualizado_em": "2026-08-17T08:38:00.470788-03:00",
   "janela_dias": 90,
   "amostra_minima": 3,
-  "total_posts_considerados": 1,
+  "total_posts_considerados": 5,
   "janelas_validas": 0,
   "ranking": [],
   "observacao": "sem janela com amostra suficiente ainda; mantenha horário padrão"
